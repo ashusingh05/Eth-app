@@ -1,74 +1,172 @@
+
+
+
+
+
 import pandas as pd
-import requests
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
+import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
+import pickle
 
-# Function to fetch historical data from Binance
-def fetch_klines(symbol, interval, start_time, end_time):
-    api_url = "https://api.binance.com/api/v3/klines"
-    params = {
-        'symbol': symbol,
-        'interval': interval,
-        'startTime': start_time,
-        'endTime': end_time,
-        'limit': 1000
-    }
-    response = requests.get(api_url, params=params)
-    return response.json() if response.status_code == 200 else []
+# Load data from pickle file
+with open("F:\DSA\bitcoin16nov_daily_data_last_year.csv", "rb") as f:
+    data = pickle.load(f)
 
-# Function to generate buy/sell signals based on SMA crossover
-def generate_signals(data, short_window=9, long_window=21):
-    data['SMA_Short'] = data['Close'].rolling(window=short_window).mean()
-    data['SMA_Long'] = data['Close'].rolling(window=long_window).mean()
+# Ensure the date column is set as the index
+data.set_index('Date', inplace=True)
 
-    # Generate signals
-    data['Signal'] = 0
-    data.loc[data['SMA_Short'] > data['SMA_Long'], 'Signal'] = 1  # Buy
-    data.loc[data['SMA_Short'] < data['SMA_Long'], 'Signal'] = -1  # Sell
+# Debugging: Show dataset range
+st.sidebar.header("Data Range")
+st.sidebar.write(f"Minimum Close Price: {data['Close'].min()}")
+st.sidebar.write(f"Maximum Close Price: {data['Close'].max()}")
 
-    return data
+# Input parameters from the user
+st.sidebar.header("Filters and Parameters")
+min_price = st.sidebar.number_input("Minimum Price", min_value=0, value=25000, step=100)
+max_price = st.sidebar.number_input("Maximum Price", min_value=0, value=40000, step=100)
 
-# Prepare data fetch
-symbol = 'BTCUSDT'
-interval = '1h'  # Hourly interval for more frequent signals
-end_time = int(datetime.now().timestamp() * 1000)
-start_time = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)  # 30 days of data
+# Trading strategy parameters
+window_size = st.sidebar.slider("Moving Average Window (days)", min_value=5, max_value=50, value=10)
+starting_capital = st.sidebar.number_input("Starting Capital", min_value=0, value=100000, step=1000)
 
-# Fetch data
-klines = fetch_klines(symbol, interval, start_time, end_time)
+# Filter data based on user input
+filtered_data = data[(data['Close'] >= min_price) & (data['Close'] <= max_price)]
 
-# Process data into a DataFrame
-data_list = []
-for entry in klines:
-    data_list.append({
-        'Date': datetime.utcfromtimestamp(entry[0] / 1000),
-        'Open': float(entry[1]),
-        'High': float(entry[2]),
-        'Low': float(entry[3]),
-        'Close': float(entry[4]),
-        'Volume': float(entry[5])
-    })
-data = pd.DataFrame(data_list)
+# Handle empty dataset scenario
+if filtered_data.empty:
+    st.error(f"No data available for the price range {min_price}-{max_price}. Please adjust the range.")
+    st.write("Showing entire dataset as fallback:")
+    st.write(data)
+    st.stop()
 
-# Generate buy/sell signals
-data = generate_signals(data)
+# Generate Buy/Sell signals
+filtered_data['Rolling_Mean'] = filtered_data['Close'].rolling(window_size).mean()
+filtered_data['Buy_Entry'] = np.where(filtered_data['Close'] > filtered_data['Rolling_Mean'], 1, 0)
+filtered_data['Sell_Entry'] = np.where(filtered_data['Close'] < filtered_data['Rolling_Mean'], 1, 0)
 
-# Display recent signals
-recent_signals = data[['Date', 'Close', 'Signal']].tail(10)
-print(recent_signals)
+# Backtesting Logic
+capital = starting_capital
+position = 0  # Current position (amount of stock held)
+cash = capital  # Initial cash
+pnl = []  # Portfolio value over time
 
-# Plot the data and signals
-plt.figure(figsize=(12, 6))
-plt.plot(data['Date'], data['Close'], label='Close Price', color='blue', alpha=0.5)
-plt.plot(data['Date'], data['SMA_Short'], label='Short SMA', color='green', alpha=0.7)
-plt.plot(data['Date'], data['SMA_Long'], label='Long SMA', color='red', alpha=0.7)
-buy_signals = data[data['Signal'] == 1]
-sell_signals = data[data['Signal'] == -1]
-plt.scatter(buy_signals['Date'], buy_signals['Close'], label='Buy Signal', color='green', marker='^', alpha=1)
-plt.scatter(sell_signals['Date'], sell_signals['Close'], label='Sell Signal', color='red', marker='v', alpha=1)
-plt.title(f"Buy/Sell Signals for {symbol}")
-plt.xlabel('Date')
-plt.ylabel('Price')
-plt.legend()
-plt.grid()
-plt.show()
+for i in range(len(filtered_data)):
+    close_price = filtered_data['Close'].iloc[i]
+
+    # Buy signal
+    if filtered_data['Buy_Entry'].iloc[i] == 1 and position == 0:
+        position = cash / close_price  # Buy with all available cash
+        cash = 0
+
+    # Sell signal
+    elif filtered_data['Sell_Entry'].iloc[i] == 1 and position > 0:
+        cash = position * close_price  # Sell all positions
+        position = 0
+
+    # Calculate current portfolio value
+    portfolio_value = cash + (position * close_price)
+    pnl.append(portfolio_value)
+
+# Add PnL to the DataFrame
+filtered_data['PnL'] = pnl
+
+# Performance Metrics
+total_return = (pnl[-1] - capital) / capital
+drawdown = min(pnl) - capital
+sharpe_ratio = (np.mean(np.diff(pnl)) / np.std(np.diff(pnl))) * np.sqrt(252) if len(pnl) > 1 else 0
+
+# Display Metrics
+st.sidebar.header("Performance Metrics")
+st.sidebar.write(f"Total Return: {total_return:.2%}")
+st.sidebar.write(f"Max Drawdown: {drawdown:.2f}")
+st.sidebar.write(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+
+# Plot Interactive Line Chart
+st.title(f"Price Chart with Buy/Sell Signals ({min_price}-{max_price})")
+line_fig = go.Figure()
+
+line_fig.add_trace(go.Scatter(
+    x=filtered_data.index,
+    y=filtered_data['Close'],
+    mode='lines',
+    name='Close Price',
+    line=dict(color='royalblue', width=2)
+))
+
+line_fig.add_trace(go.Scatter(
+    x=filtered_data[filtered_data['Buy_Entry'] == 1].index,
+    y=filtered_data[filtered_data['Buy_Entry'] == 1]['Close'],
+    mode='markers',
+    name='Buy Signal',
+    marker=dict(color='green', symbol='triangle-up', size=12, line=dict(color='black', width=2))
+))
+
+line_fig.add_trace(go.Scatter(
+    x=filtered_data[filtered_data['Sell_Entry'] == 1].index,
+    y=filtered_data[filtered_data['Sell_Entry'] == 1]['Close'],
+    mode='markers',
+    name='Sell Signal',
+    marker=dict(color='red', symbol='triangle-down', size=12, line=dict(color='black', width=2))
+))
+
+line_fig.update_layout(
+    title="Price Chart with Buy/Sell Signals",
+    xaxis_title="Date",
+    yaxis_title="Price",
+    template='plotly_dark',
+    xaxis=dict(showgrid=True, gridcolor='gray', zeroline=False),
+    yaxis=dict(showgrid=True, gridcolor='gray', zeroline=False),
+    font=dict(size=12)
+)
+
+st.plotly_chart(line_fig)
+
+# Plot Portfolio Equity Curve
+st.title("Portfolio Equity Curve")
+equity_fig = go.Figure()
+equity_fig.add_trace(go.Scatter(
+    x=filtered_data.index,
+    y=filtered_data['PnL'],
+    mode='lines',
+    name='Equity Curve',
+    line=dict(color='gold', width=3)
+))
+
+equity_fig.update_layout(
+    title="Portfolio Equity Curve",
+    xaxis_title="Date",
+    yaxis_title="Portfolio Value",
+    template='plotly_dark',
+    xaxis=dict(showgrid=True, gridcolor='gray', zeroline=False),
+    yaxis=dict(showgrid=True, gridcolor='gray', zeroline=False),
+    font=dict(size=12)
+)
+
+st.plotly_chart(equity_fig)
+
+# Plot Candlestick Chart
+st.title("Candlestick Chart")
+candlestick_fig = go.Figure()
+candlestick_fig.add_trace(go.Candlestick(
+    x=filtered_data.index,
+    open=filtered_data['Open'],
+    high=filtered_data['High'],
+    low=filtered_data['Low'],
+    close=filtered_data['Close'],
+    name='Candlestick',
+    increasing_line_color='green',
+    decreasing_line_color='red'
+))
+
+candlestick_fig.update_layout(
+    title="Bitcoin Candlestick Chart",
+    xaxis_title="Date",
+    yaxis_title="Price",
+    template='plotly_dark',
+    xaxis=dict(showgrid=True, gridcolor='gray', zeroline=False),
+    yaxis=dict(showgrid=True, gridcolor='gray', zeroline=False),
+    font=dict(size=12),
+)
+
+st.plotly_chart(candlestick_fig)
